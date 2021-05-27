@@ -81,6 +81,22 @@ def flop(model, input_shape, device):
     return total
 
 
+def compare_model_dicts(model_dict_1, model_dict_2):
+    models_differ = 0
+    for key_item_1, key_item_2 in zip(model_dict_1.items(), model_dict_2.items()):
+        if torch.equal(key_item_1[1], key_item_2[1]):
+            pass
+        else:
+            models_differ += 1
+            if (key_item_1[0] == key_item_2[0]):
+                print('Mismatch found between', key_item_1[0], 'and', key_item_2[0])
+                return False
+            else:
+                raise Exception
+    if models_differ == 0:
+        return True
+
+
 # def conservation(model, scores, batchnorm, residual):
 #     r"""Summary of conservation results for a model.
 #     """
