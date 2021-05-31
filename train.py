@@ -126,9 +126,21 @@ def instability_analysis(model, loss, optimizer, train_loader, test_loader, devi
     #     print(f'\r[instability analysis] Writing instability analysis results to epoch_{epoch}-instability_{analysis}.txt')
     #     f.write('Instability analysis method: '+method.__name__+'\nInstability analysis: '+analysis)
 
-    print('l2 distance')
     method = classification_differences
-    analysis = method(insta_model_1, insta_model_2, test_loader, loss)
+    if method == interpolate_models:
+        print('\r[instability analysis] Now interpolating models')
+        alphas, errors = interpolate_models(insta_model_1, insta_model_2, test_loader, loss)
+
+        _, insta_model1_acc1, _ = eval(insta_model_1, loss, test_loader, device, verbose)
+        _, insta_model2_acc1, _ = eval(insta_model_2, loss, test_loader, device, verbose)
+        error_model1 = 1 - insta_model1_acc1 / 100
+        error_model2 = 1 - insta_model2_acc1 / 100
+        error_sup = max(errors)
+        mean_error = (error_model1 + error_model2) / 2
+
+        instability = error_sup - mean_error
+    else:
+        analysis = method(insta_model_1, insta_model_2, test_loader, loss)
 
     with open(os.path.join('Output', f'epoch_{epoch}-method_{method.__name__}-instability_{analysis}.txt'), 'w') as f:
         print(f'\r[instability analysis] Writing instability analysis results to epoch_{epoch}-instability_{analysis}.txt')
@@ -245,4 +257,50 @@ def classification_differences(model1, model2, test_loader, loss, verbose=True):
           f' {len(test_loader.dataset)} with max diff being {max_possible_value}')
 
     return classification_diff*100
+
+# function inspired by
+# https://discuss.pytorch.org/t/how-to-linearly-interpolate-between-two-models/98091
+def interpolate_models(model1, model2, test_loader, loss, verbose=True):
+    '''
+    linearly interpolates multiple times for the two models given
+    :param model1: model, e.g. ResNet object
+    :param model2: model, e.g. ResNet object
+    :param test_loader: dataset
+    :param loss: loss function
+    :param verbose: bool for verbose
+    :return: list of accuracies of interpolated models
+    '''
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # list of 10 numbers evenly spaced between 0 and 1
+    alphas = np.linspace(0, 1, 10)
+    # accuracy list of shape alphas
+    acc_array = np.zeros(alphas.shape)
+
+    iter = 0
+    for alpha in alphas:
+        # new_model1 = copy.deepcopy(model1)
+        # new_model2 = copy.deepcopy(model2)
+        temp_model = copy.deepcopy(model1)
+        temp_state_dict = temp_model.state_dict()
+
+        # for n, p in new_model.named_parameters():
+        for n, p in model1.state_dict().items():
+            # linear interpolation: alpha*W1 + (1-alpha)W2
+            # https://stackoverflow.com/questions/49446785/how-can-i-update-the-parameters-of-a-neural-network-in-pytorch
+            inter_p = alpha * p + (1 - alpha) * {n2: p2 for n2, p2 in model2.state_dict().items()}[n]
+
+            temp_state_dict[n].copy_(inter_p)
+
+        temp_model.load_state_dict(temp_state_dict)
+        # _, inter_acc = evaluate_pgd(new_model1, val_loader, 20, 1, None)
+        _, temp_model_acc1, _ = eval(temp_model, loss, test_loader, device, verbose)
+        # store error of interpolated model
+        print(f'\r[instability analysis] Linear interpolation with alpha {alpha} '
+              f'gave an error of {100 - temp_model_acc1}%')
+        acc_array[iter] = 1 - temp_model_acc1/100
+        iter = iter + 1
+        del temp_model
+
+    return alphas, acc_array
 
