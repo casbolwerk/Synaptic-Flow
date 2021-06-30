@@ -105,6 +105,7 @@ def model(model_architecture, model_class):
         'vgg19' : lottery_vgg.vgg19,
         'vgg19-bn' : lottery_vgg.vgg19_bn,
         'resnet20': lottery_resnet.resnet20,
+        'resnet20path': lottery_resnet.resnet20path,
         'resnet32': lottery_resnet.resnet32,
         'resnet44': lottery_resnet.resnet44,
         'resnet56': lottery_resnet.resnet56,

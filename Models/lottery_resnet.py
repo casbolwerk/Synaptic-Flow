@@ -5,10 +5,12 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from Layers import layers
 
+# torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
 class Block(nn.Module):
     """A ResNet block."""
@@ -110,8 +112,21 @@ def _plan(D, W):
 
     return plan
 
-def _resnet(arch, plan, num_classes, dense_classifier, pretrained):
+def _resnet(arch, plan, num_classes, dense_classifier, pretrained, path=''):
     model = ResNet(plan, num_classes, dense_classifier)
+    print(pretrained, path)
+    if pretrained and path:
+        if path.endswith('.pt'):
+            pretrained_path = path.format(arch)
+            print(pretrained_path)
+            pretrained_dict = torch.load(pretrained_path)
+            model_dict = model.state_dict()
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
+
+            return model
+        else:
+            assert False, 'If model path is given, it has to be pytorch .pt format'
     if pretrained:
         pretrained_path = 'Models/pretrained/{}-lottery.pt'.format(arch)
         pretrained_dict = torch.load(pretrained_path)
@@ -125,6 +140,10 @@ def _resnet(arch, plan, num_classes, dense_classifier, pretrained):
 def resnet20(input_shape, num_classes, dense_classifier=False, pretrained=False):
     plan = _plan(20, 16)
     return _resnet('resnet20', plan, num_classes, dense_classifier, pretrained)
+
+def resnet20path(input_shape, num_classes, dense_classifier=False, pretrained=False, path=''):
+    plan = _plan(20, 16)
+    return _resnet('resnet20', plan, num_classes, dense_classifier, pretrained, path)
 
 def resnet32(input_shape, num_classes, dense_classifier=False, pretrained=False):
     plan = _plan(32, 16)

@@ -1,15 +1,21 @@
 import os
 import torch
+import torch.backends.cudnn as cudnn
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import copy
+import uuid
+from pathlib import Path
 
 from Utils.metrics import compare_model_dicts
 
-def train(model, loss, optimizer, dataloader, device, epoch, verbose, log_interval=10):
+def train(model, loss, optimizer, dataloader, device, epoch, verbose, log_interval=10, scheduler=None):
+    cudnn.benchmark = True
     model.train()
     total = 0
+
+    unique_id = str(uuid.uuid4()).replace('-', '')
     for batch_idx, (data, target) in enumerate(dataloader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
@@ -22,9 +28,51 @@ def train(model, loss, optimizer, dataloader, device, epoch, verbose, log_interv
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(dataloader.dataset),
                 100. * batch_idx / len(dataloader), train_loss.item()))
+        # if epoch < 3:
+        #     print('Saving Batch: [{}/{} ({:.0f}%)] {}'.format(
+        #         batch_idx * len(data), len(dataloader.dataset),
+        #         100. * batch_idx / len(dataloader), epoch))
+        #     Path(f"Output/{unique_id}_batch_benchmark_epoch{epoch}").mkdir(parents=True, exist_ok=True)
+        #     torch.save(model.state_dict(), "Output/{}_batch_benchmark_epoch{}/batch{}-{}_model.pt".format(unique_id, epoch, batch_idx * len(data), len(dataloader.dataset)))
+        #     torch.save(optimizer.state_dict(), "Output/{}_batch_benchmark_epoch{}/batch{}-{}_optimizer.pt".format(unique_id, epoch, batch_idx * len(data), len(dataloader.dataset)))
+        #     if scheduler:
+        #         torch.save(scheduler.state_dict(), "Output/{}_batch_benchmark_epoch{}/batch{}-{}_scheduler.pt".format(unique_id, epoch, batch_idx * len(data), len(dataloader.dataset)))
     return total / len(dataloader.dataset)
 
+def insta_train(model, loss, optimizer, optimizer2, train_loader, train_loader2, test_loader, device, epoch, epochs, verbose, log_interval=10):
+    cudnn.benchmark = True
+    model.train()
+    total = 0
+
+    unique_id = str(uuid.uuid4()).replace('-', '')
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+
+        print(f'\r[pretrain loop] Epoch {epoch}, batch {batch_idx * len(data)}/{len(train_loader.dataset)} instability analysis')
+        model1, model2 = instability_analysis(model, loss, optimizer, optimizer2, train_loader, train_loader2,
+                                              test_loader, device, epoch, epochs, verbose)
+
+        Path(f"Output/{unique_id}_epoch{epoch}").mkdir(parents=True, exist_ok=True)
+
+        torch.save(model1.state_dict(), "Output/{}_epoch{}/insta_model1.pt".format(unique_id, epoch))
+        torch.save(model2.state_dict(), "Output/{}_epoch{}/insta_model2.pt".format(unique_id, epoch))
+        torch.save(optimizer.state_dict(), "Output/{}_epoch{}/insta_optimizer1.pt".format(unique_id, epoch))
+        torch.save(optimizer2.state_dict(), "Output/{}_epoch{}/insta_optimizer2.pt".format(unique_id, epoch))
+
+        optimizer.zero_grad()
+        output = model(data)
+        train_loss = loss(output, target)
+        total += train_loss.item() * data.size(0)
+        train_loss.backward()
+        optimizer.step()
+        if verbose & (batch_idx % log_interval == 0):
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                100. * batch_idx / len(train_loader), train_loss.item()))
+    return total / len(train_loader.dataset)
+
 def eval(model, loss, dataloader, device, verbose):
+    cudnn.benchmark = True
     model.eval()
     total = 0
     correct1 = 0
@@ -47,6 +95,7 @@ def eval(model, loss, dataloader, device, verbose):
     return average_loss, accuracy1, accuracy5
 
 def eval_preds(model, loss, dataloader, device, verbose):
+    cudnn.benchmark = True
     model.eval()
     total = 0
     correct1 = 0
@@ -72,7 +121,7 @@ def train_eval_loop(model, loss, optimizer, scheduler, train_loader, test_loader
     test_loss, accuracy1, accuracy5 = eval(model, loss, test_loader, device, verbose)
     rows = [[np.nan, test_loss, accuracy1, accuracy5]]
     for epoch in tqdm(range(epochs)):
-        train_loss = train(model, loss, optimizer, train_loader, device, epoch, verbose)
+        train_loss = train(model, loss, optimizer, train_loader, device, epoch, verbose, scheduler=scheduler)
         test_loss, accuracy1, accuracy5 = eval(model, loss, test_loader, device, verbose)
         row = [train_loss, test_loss, accuracy1, accuracy5]
         scheduler.step()
@@ -80,43 +129,127 @@ def train_eval_loop(model, loss, optimizer, scheduler, train_loader, test_loader
     columns = ['train_loss', 'test_loss', 'top1_accuracy', 'top5_accuracy']
     return pd.DataFrame(rows, columns=columns)
 
-def pretrain_analysis_loop(model, loss, optimizer, scheduler, train_loader, test_loader, device, epochs, verbose):
+def train_analysis_loop(model, loss, optimizer, optimizer2, scheduler, train_loader, train_loader2, test_loader, device, epochs, verbose):
     print('\r[pretrain loop] Now starting pretraining...')
     test_loss, accuracy1, accuracy5 = eval(model, loss, test_loader, device, verbose)
     rows = [[np.nan, test_loss, accuracy1, accuracy5]]
+
+    unique_id = str(uuid.uuid4()).replace('-', '')
+
     for epoch in tqdm(range(epochs)):
         print(f'\r[pretrain loop] Epoch {epoch} of pretraining')
-        train_loss = train(model, loss, optimizer, train_loader, device, epoch, verbose)
+        train_loss = insta_train(model, loss, optimizer, optimizer2, train_loader, train_loader2, test_loader, device, epoch, epochs, verbose)
+        test_loss, accuracy1, accuracy5 = eval(model, loss, test_loader, device, verbose)
 
         # instead of evaluating, implement an instability analysis and run it
         print(f'\r[pretrain loop] Epoch {epoch} instability analysis')
-        instability_analysis(model, loss, optimizer, train_loader, test_loader, device, epoch, verbose)
-        # row = [train_loss, test_loss, accuracy1, accuracy5]
+        # model1, model2 = instability_analysis(model, loss, optimizer, optimizer2, train_loader, train_loader2, test_loader, device, epoch, epochs, verbose)
+        row = [train_loss, test_loss, accuracy1, accuracy5]
+
+        # Path(f"Output/{unique_id}_epoch{epoch}").mkdir(parents=True, exist_ok=True)
+        #
+        # torch.save(model1.state_dict(), "Output/{}_epoch{}/insta_model1.pt".format(unique_id, epoch))
+        # torch.save(model2.state_dict(), "Output/{}_epoch{}/insta_model2.pt".format(unique_id, epoch))
+        # torch.save(optimizer.state_dict(), "Output/{}_epoch{}/insta_optimizer1.pt".format(unique_id, epoch))
+        # torch.save(optimizer2.state_dict(), "Output/{}_epoch{}/insta_optimizer2.pt".format(unique_id, epoch))
+        # torch.save(scheduler.state_dict(), "Output/{}_epoch{}/insta_scheduler.pt".format(unique_id, epoch))
+
         scheduler.step()
-        # rows.append(row)
+        rows.append(row)
+
     columns = ['train_loss', 'test_loss', 'top1_accuracy', 'top5_accuracy']
     return pd.DataFrame(rows, columns=columns)
 
-def instability_analysis(model, loss, optimizer, train_loader, test_loader, device, epoch, verbose):
+def train_eval_loop(model, loss, optimizer, scheduler, train_loader, test_loader, device, epochs, verbose):
+    test_loss, accuracy1, accuracy5 = eval(model, loss, test_loader, device, verbose)
+    rows = [[np.nan, test_loss, accuracy1, accuracy5]]
+    for epoch in tqdm(range(epochs)):
+        train_loss = train(model, loss, optimizer, train_loader, device, epoch, verbose, scheduler=scheduler)
+        test_loss, accuracy1, accuracy5 = eval(model, loss, test_loader, device, verbose)
+        row = [train_loss, test_loss, accuracy1, accuracy5]
+        scheduler.step()
+        rows.append(row)
+    columns = ['train_loss', 'test_loss', 'top1_accuracy', 'top5_accuracy']
+    return pd.DataFrame(rows, columns=columns)
+
+from Utils import load
+
+def instability_analysis(model, model2, loss, optimizer, optimizer2, scheduler, scheduler2, train_loader, train_loader_2, test_loader, device, epoch, epochs, verbose):
     print('\r[instability analysis] Now starting analysis...')
     # launch two training sessions (ensure that they have different optimizers)
     optimizer_1 = optimizer
-    optimizer_2 = optimizer
+    optimizer_2 = optimizer2
 
     # get model weights dictionary
     original_dict = model.state_dict()
 
-    insta_model_1 = copy.deepcopy(model)
-    insta_model_2 = copy.deepcopy(model)
+    insta_model_1 = model
+    insta_model_2 = model2
+    analysis = linear_interpolation(insta_model_1, insta_model_2, test_loader, loss, device)
+    # input_shape, num_classes = load.dimension('cifar10')
+    # insta_model_1 = load.model('resnet20', 'lottery')(input_shape,
+    #                                                  num_classes,
+    #                                                  False,
+    #                                                  False).to(device)
+    # insta_model_1_dict = insta_model_1.state_dict()
+    # insta_model_1_dict.update(original_dict)
+    # insta_model_1.load_state_dict(insta_model_1_dict)
+    #
+    # insta_model_2 = load.model('resnet20', 'lottery')(input_shape,
+    #                                                  num_classes,
+    #                                                  False,
+    #                                                  False).to(device)
+    # insta_model_2_dict = insta_model_2.state_dict()
+    # insta_model_2_dict.update(original_dict)
+    # insta_model_2.load_state_dict(insta_model_2_dict)
 
-    #maybe run training sessions for more than one epoch
-    # for epoch in tqdm(range(epochs/10)):
-    print('\r[instability analysis] Training temp model 1')
-    train_loss_model_1 = train(insta_model_1, loss, optimizer_1, train_loader, device, epoch, verbose)
-    print('\r[instability analysis] Training temp model 2')
-    train_loss_model_2 = train(insta_model_2, loss, optimizer_2, train_loader, device, epoch, verbose)
+    # insta_model_1 = copy.deepcopy(model)
+    # # insta_model_1.cuda(0)
+    # # insta_model_1.to(device)
+    # insta_model_2 = copy.deepcopy(model)
+    # # insta_model_2.cuda(0)
+    # # insta_model_2.to(device)
 
-    assert compare_model_dicts(original_dict, model.state_dict()), '\r[instability analysis] MODEL COPY NOT DEEPCOPY'
+    unique_id = str(uuid.uuid4()).replace('-', '')
+    for _epoch in tqdm(range(epochs - epoch)):
+        #maybe run training sessions for more than one epoch
+        # for epoch in tqdm(range(epochs/10)):
+        print('\r[instability analysis] Training temp model 1')
+        train_loss_model_1 = train(insta_model_1, loss, optimizer_1, train_loader, device, _epoch, verbose)
+        _, model1_accuracy1, _ = eval(insta_model_1, loss, test_loader, device, verbose)
+        print('\r[instability analysis] Training temp model 2')
+        train_loss_model_2 = train(insta_model_2, loss, optimizer_2, train_loader_2, device, _epoch, verbose)
+        _, model2_accuracy1, _ = eval(insta_model_2, loss, test_loader, device, verbose)
+
+        # assert compare_model_dicts(original_dict, model.state_dict()), '\r[instability analysis] MODEL COPY NOT DEEPCOPY'
+
+        scheduler.step()
+        scheduler2.step()
+
+        if _epoch % 10 == 0:
+            analysis = linear_interpolation(insta_model_1, insta_model_2, test_loader, loss, device)
+
+            print('Saving Epoch: [{}/{} ({:.0f}%)]'.format(
+                _epoch, epochs - epoch,
+                100. * _epoch / (epochs - epoch), epoch))
+            Path(f"Output/{unique_id}_epoch{_epoch}").mkdir(parents=True, exist_ok=True)
+            torch.save(insta_model_1.state_dict(),
+                       "Output/{}_epoch{}/insta_model_1_acc{}.pt".format(unique_id, _epoch, model1_accuracy1))
+            torch.save(insta_model_2.state_dict(),
+                       "Output/{}_epoch{}/insta_model_2_acc{}.pt".format(unique_id, _epoch, model2_accuracy1))
+            torch.save(optimizer.state_dict(),
+                       "Output/{}_epoch{}/optimizer_1.pt".format(unique_id, _epoch))
+            torch.save(optimizer_2.state_dict(),
+                       "Output/{}_epoch{}/optimizer_2.pt".format(unique_id, _epoch))
+            torch.save(scheduler.state_dict(),
+                       "Output/{}_epoch{}/scheduler_1.pt".format(unique_id, _epoch))
+            torch.save(scheduler2.state_dict(),
+                       "Output/{}_epoch{}/scheduler_2.pt".format(unique_id, _epoch))
+
+            with open(os.path.join('Output', f'{unique_id}_epoch{_epoch}', f'pretrain_test-epoch_{_epoch}-instability_{analysis}.txt'), 'w') as f:
+                print(
+                    f'\r[instability analysis] Writing instability analysis results to epoch_{_epoch}-instability_{analysis}.txt')
+                f.write('Instability analysis method: ' + 'linear interpolation' + '\nInstability analysis: ' + str(analysis))
 
     # # compare the two through instability analysis
     # method = cosine_similarity
@@ -126,27 +259,20 @@ def instability_analysis(model, loss, optimizer, train_loader, test_loader, devi
     #     print(f'\r[instability analysis] Writing instability analysis results to epoch_{epoch}-instability_{analysis}.txt')
     #     f.write('Instability analysis method: '+method.__name__+'\nInstability analysis: '+analysis)
 
-    method = classification_differences
+    method = interpolate_models
     if method == interpolate_models:
+        # linear interpolation and instability according to linear mode connectivity by Frankle et al.
         print('\r[instability analysis] Now interpolating models')
-        alphas, errors = interpolate_models(insta_model_1, insta_model_2, test_loader, loss)
-
-        _, insta_model1_acc1, _ = eval(insta_model_1, loss, test_loader, device, verbose)
-        _, insta_model2_acc1, _ = eval(insta_model_2, loss, test_loader, device, verbose)
-        error_model1 = 1 - insta_model1_acc1 / 100
-        error_model2 = 1 - insta_model2_acc1 / 100
-        error_sup = max(errors)
-        mean_error = (error_model1 + error_model2) / 2
-
-        instability = error_sup - mean_error
+        analysis = linear_interpolation(insta_model_1, insta_model_2, test_loader, loss, device)
     else:
         analysis = method(insta_model_1, insta_model_2, test_loader, loss)
 
-    with open(os.path.join('Output', f'epoch_{epoch}-method_{method.__name__}-instability_{analysis}.txt'), 'w') as f:
+    # with open(os.path.join('Output', f'epoch_{epoch}-method_{method.__name__}-instability_{analysis}.txt'), 'w') as f:
+    with open(os.path.join('Output', f'pretrain_test-epoch_{epoch}-instability_{analysis}.txt'), 'w') as f:
         print(f'\r[instability analysis] Writing instability analysis results to epoch_{epoch}-instability_{analysis}.txt')
         f.write('Instability analysis method: '+method.__name__+'\nInstability analysis: '+str(analysis))
 
-    return
+    return insta_model_1, insta_model_2
 
 from torch.nn import functional as F
 
@@ -258,8 +384,30 @@ def classification_differences(model1, model2, test_loader, loss, verbose=True):
 
     return classification_diff*100
 
+def linear_interpolation(model1, model2, test_loader, loss, device, verbose=True):
+    print(device)
+
+    alphas, errors = interpolate_models(model1, model2, test_loader, loss)
+    print(errors)
+
+    _, insta_model1_acc1, _ = eval(model1, loss, test_loader, device, verbose)
+    _, insta_model2_acc1, _ = eval(model2, loss, test_loader, device, verbose)
+    error_model1 = 1 - insta_model1_acc1 / 100
+    error_model2 = 1 - insta_model2_acc1 / 100
+    print(f'the models individually have errors of {error_model1} and {error_model2}')
+    error_sup = max(errors)
+    mean_error = (error_model1 + error_model2) / 2
+    print(mean_error)
+
+    # final instability
+    analysis = error_sup - mean_error
+    print(analysis)
+
+    return analysis
+
 # function inspired by
 # https://discuss.pytorch.org/t/how-to-linearly-interpolate-between-two-models/98091
+@torch.no_grad() # I believe this has to be in front since we're changing wweights??
 def interpolate_models(model1, model2, test_loader, loss, verbose=True):
     '''
     linearly interpolates multiple times for the two models given
@@ -273,10 +421,11 @@ def interpolate_models(model1, model2, test_loader, loss, verbose=True):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # list of 10 numbers evenly spaced between 0 and 1
-    alphas = np.linspace(0, 1, 10)
+    alphas = np.linspace(0, 1, 20)
     # accuracy list of shape alphas
     acc_array = np.zeros(alphas.shape)
 
+    # list of alphas we interpolate models from
     iter = 0
     for alpha in alphas:
         # new_model1 = copy.deepcopy(model1)
@@ -284,17 +433,28 @@ def interpolate_models(model1, model2, test_loader, loss, verbose=True):
         temp_model = copy.deepcopy(model1)
         temp_state_dict = temp_model.state_dict()
 
+        # interpolate all weights to new model
         # for n, p in new_model.named_parameters():
         for n, p in model1.state_dict().items():
             # linear interpolation: alpha*W1 + (1-alpha)W2
             # https://stackoverflow.com/questions/49446785/how-can-i-update-the-parameters-of-a-neural-network-in-pytorch
+            # print(n)
             inter_p = alpha * p + (1 - alpha) * {n2: p2 for n2, p2 in model2.state_dict().items()}[n]
+            # print('INTER P', inter_p)
+            # print('P1', p)
+            # print('P2', {n2: p2 for n2, p2 in model2.state_dict().items()}[n])
 
+            # print('STATE DICT BEFORE')
+            # print(temp_state_dict[n])
             temp_state_dict[n].copy_(inter_p)
+            # print('STATE DICT AFTER')
+            # print(temp_state_dict[n])
 
         temp_model.load_state_dict(temp_state_dict)
         # _, inter_acc = evaluate_pgd(new_model1, val_loader, 20, 1, None)
         _, temp_model_acc1, _ = eval(temp_model, loss, test_loader, device, verbose)
+        # print(alpha)
+        # print(temp_model_acc1)
         # store error of interpolated model
         print(f'\r[instability analysis] Linear interpolation with alpha {alpha} '
               f'gave an error of {100 - temp_model_acc1}%')

@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import uuid
+import pathlib
+
 from Utils import load
 from Utils import generator
 from Utils import metrics
@@ -18,6 +21,7 @@ def run(args):
     input_shape, num_classes = load.dimension(args.dataset) 
     prune_loader = load.dataloader(args.dataset, args.prune_batch_size, True, args.workers, args.prune_dataset_ratio * num_classes)
     train_loader = load.dataloader(args.dataset, args.train_batch_size, True, args.workers)
+    train_loader2 = load.dataloader(args.dataset, args.train_batch_size, True, args.workers)
     test_loader = load.dataloader(args.dataset, args.test_batch_size, False, args.workers)
 
     ## Model, Loss, Optimizer ##
@@ -26,16 +30,26 @@ def run(args):
                                                      num_classes, 
                                                      args.dense_classifier, 
                                                      args.pretrained).to(device)
+    model.cuda(args.gpu)
+    model.to(device)
+
     loss = nn.CrossEntropyLoss()
     opt_class, opt_kwargs = load.optimizer(args.optimizer)
     optimizer = opt_class(generator.parameters(model), lr=args.lr, weight_decay=args.weight_decay, **opt_kwargs)
+    insta_lr = np.random.normal(args.lr, args.lr/10)
+    insta_lr = max(0.001, insta_lr)
+    insta_wd = np.random.normal(args.weight_decay, args.weight_decay/10)
+    insta_wd = max(0.0001, insta_wd)
+    insta_optimizer = opt_class(generator.parameters(model), lr=insta_lr, weight_decay=insta_wd, **opt_kwargs)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drops, gamma=args.lr_drop_rate)
 
 
     ## Pre-Train ##
     print('Pre-Train for {} epochs.'.format(args.pre_epochs))
-    pre_result = pretrain_analysis_loop(model, loss, optimizer, scheduler, train_loader,
-                                 test_loader, device, args.pre_epochs, args.verbose)
+    pre_result = train_eval_loop(model, loss, optimizer, scheduler, train_loader,
+                                    test_loader, device, args.pre_epochs, args.verbose)
+    # pre_result = train_analysis_loop(model, loss, optimizer, insta_optimizer, scheduler, train_loader,
+    #                                  train_loader2, test_loader, device, args.pre_epochs, args.verbose)
 
     ## Prune ##
     print('Pruning with {} for {} epochs.'.format(args.pruner, args.prune_epochs))
@@ -44,11 +58,14 @@ def run(args):
     prune_loop(model, loss, pruner, prune_loader, device, sparsity, 
                args.compression_schedule, args.mask_scope, args.prune_epochs, args.reinitialize, args.prune_train_mode, args.shuffle, args.invert)
 
-    
+    # instability_analysis(model, loss, optimizer, insta_optimizer, train_loader, train_loader2, test_loader, device, args.pre_epochs, args.post_epochs, args.verbose)
+
     ## Post-Train ##
     print('Post-Training for {} epochs.'.format(args.post_epochs))
-    post_result = train_eval_loop(model, loss, optimizer, scheduler, train_loader, 
-                                  test_loader, device, args.post_epochs, args.verbose) 
+    post_result = train_eval_loop(model, loss, optimizer, scheduler, train_loader,
+                                  test_loader, device, args.post_epochs, args.verbose)
+    # post_result = train_analysis_loop(model, loss, optimizer, insta_optimizer, scheduler, train_loader,
+    #                                     train_loader2, test_loader, device, args.post_epochs, args.verbose)
 
     ## Display Results ##
     frames = [pre_result.head(1), pre_result.tail(1), post_result.head(1), post_result.tail(1)]
